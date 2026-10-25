@@ -5,7 +5,10 @@ const cors = require("cors");
 
 // 使用刚刚建立的数据库连接和 Supabase 客户端
 const { pool } = require("./db");
-const { supabase } = require("./supabaseClient");
+const {
+    supabase,
+    supabaseAdmin,
+} = require("./supabaseClient");
 
 const app = express();
 
@@ -502,6 +505,112 @@ app.delete("/workouts/:id", verifySupabaseSession, async (req, res) => {
         });
     }
 });
+// 为 private Storage 图片建立临时 signed URL
+async function addSignedImageUrls(posts) {
+    const postsWithImageUrls = [];
+
+    for (const post of posts) {
+        let imageUrl = post.image_url;
+
+        if (post.image_path) {
+            const {
+                data,
+                error,
+            } = await supabaseAdmin.storage
+                .from("post-images")
+                .createSignedUrl(
+                    post.image_path,
+                    60 * 60
+                );
+
+            if (error) {
+                console.error(
+                    "Unable to create signed image URL:",
+                    error.message
+                );
+
+                imageUrl = null;
+            } else {
+                imageUrl = data.signedUrl;
+            }
+        }
+
+        postsWithImageUrls.push({
+            ...post,
+            image_url: imageUrl,
+        });
+    }
+
+    return postsWithImageUrls;
+}
+// 清理上传成功但没有被帖子使用的图片
+app.delete(
+  "/post-images/cleanup",
+  verifySupabaseSession,
+  async (req, res) => {
+    const { image_path } = req.body || {};
+
+    if (typeof image_path !== "string" || !image_path.trim()) {
+      return res.status(400).json({
+        error: "Image path is required",
+      });
+    }
+
+    const cleanImagePath = image_path.trim();
+    const userFolder = `${req.user.userId}/`;
+
+    // 用户只能清理自己 UUID 文件夹中的图片
+    if (!cleanImagePath.startsWith(userFolder)) {
+      return res.status(403).json({
+        error: "You cannot delete this image",
+      });
+    }
+
+    try {
+      // 已经属于帖子的图片不能通过此接口删除
+      const linkedPost = await pool.query(
+        `SELECT id
+         FROM posts
+         WHERE author_id = $1
+           AND image_path = $2
+         LIMIT 1`,
+        [req.user.userId, cleanImagePath]
+      );
+
+      if (linkedPost.rows.length > 0) {
+        return res.status(409).json({
+          error: "This image belongs to a post",
+        });
+      }
+
+      const { error: storageError } = await supabaseAdmin.storage
+        .from("post-images")
+        .remove([cleanImagePath]);
+
+      if (storageError) {
+        console.error("Image cleanup failed:", storageError.message);
+
+        return res.status(502).json({
+          error: "Unable to clean up image",
+        });
+      }
+
+      res.json({
+        message: "Unused image deleted successfully",
+      });
+    } catch (error) {
+      console.error(
+        "DELETE /post-images/cleanup failed:",
+        error.message
+      );
+
+      res.status(500).json({
+        error: "Unable to clean up image",
+      });
+    }
+  }
+);
+
 // 发布健身动态
 app.post("/posts", verifySupabaseSession, async (req, res) => {
     const {
@@ -609,7 +718,13 @@ app.get("/posts", verifySupabaseSession, async (req, res) => {
         );
 
         // 没有动态时返回空数组
-        res.json(result.rows);
+        // 只为已经通过帖子权限检查的动态建立图片链接
+        const posts = await addSignedImageUrls(
+            result.rows
+        );
+
+        // 没有动态时返回空数组
+        res.json(posts);
     } catch (error) {
         console.error("GET /posts failed:", error.message);
 
@@ -703,7 +818,7 @@ app.delete("/posts/:id", verifySupabaseSession, async (req, res) => {
         const result = await pool.query(
             `DELETE FROM posts
        WHERE id = $1 AND author_id = $2
-       RETURNING id`,
+       RETURNING id, image_path`,
             [id, req.user.userId]
         );
 
@@ -712,6 +827,25 @@ app.delete("/posts/:id", verifySupabaseSession, async (req, res) => {
             return res.status(404).json({
                 error: "Post not found",
             });
+        }
+
+        const imagePath =
+            result.rows[0].image_path;
+
+        // 帖子删除成功后，清理对应的 Storage 图片
+        if (imagePath) {
+            const {
+                error: storageError,
+            } = await supabaseAdmin.storage
+                .from("post-images")
+                .remove([imagePath]);
+
+            if (storageError) {
+                console.error(
+                    "Unable to delete post image:",
+                    storageError.message
+                );
+            }
         }
 
         res.json({
@@ -1193,6 +1327,161 @@ app.get(
         }
     }
 );
+// 暂时保存 free-exercise-db 的动作资料
+// 服务器重新启动后会重新下载一次
+let freeExerciseCache = null;
+
+// 从 free-exercise-db 搜索带图片的健身动作
+app.get(
+    "/exercise-images",
+    verifySupabaseSession,
+    async (req, res) => {
+        const {
+            name,
+            muscle,
+            type,
+            difficulty,
+        } = req.query;
+
+        // 至少需要一个搜索条件
+        if (!name && !muscle && !type && !difficulty) {
+            return res.status(400).json({
+                error:
+                    "Provide name, muscle, type, or difficulty",
+            });
+        }
+
+        try {
+            // 第一次搜索时才下载资料
+            if (!freeExerciseCache) {
+                const response = await fetch(
+                    "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/dist/exercises.json"
+                );
+
+                if (!response.ok) {
+                    return res.status(502).json({
+                        error:
+                            "Exercise image service is unavailable",
+                    });
+                }
+
+                freeExerciseCache =
+                    await response.json();
+            }
+
+            const searchName = name
+                ? name.trim().toLowerCase()
+                : "";
+
+            // 前端使用 lower_back，
+            // 数据集使用 lower back
+            const searchMuscle = muscle
+                ? muscle
+                      .trim()
+                      .toLowerCase()
+                      .split("_")
+                      .join(" ")
+                : "";
+
+            const searchType = type
+                ? type
+                      .trim()
+                      .toLowerCase()
+                      .split("_")
+                      .join(" ")
+                : "";
+
+            const searchDifficulty = difficulty
+                ? difficulty.trim().toLowerCase()
+                : "";
+
+            const results = freeExerciseCache
+                .filter((exercise) => {
+                    const exerciseName =
+                        exercise.name.toLowerCase();
+
+                    const primaryMuscles =
+                        exercise.primaryMuscles || [];
+
+                    const secondaryMuscles =
+                        exercise.secondaryMuscles || [];
+
+                    const allMuscles = [
+                        ...primaryMuscles,
+                        ...secondaryMuscles,
+                    ].map((item) =>
+                        item.toLowerCase()
+                    );
+
+                    const nameMatches =
+                        !searchName ||
+                        exerciseName.includes(
+                            searchName
+                        );
+
+                    const muscleMatches =
+                        !searchMuscle ||
+                        allMuscles.includes(
+                            searchMuscle
+                        );
+
+                    const typeMatches =
+                        !searchType ||
+                        exercise.category ===
+                            searchType;
+
+                    const difficultyMatches =
+                        !searchDifficulty ||
+                        exercise.level ===
+                            searchDifficulty;
+
+                    return (
+                        nameMatches &&
+                        muscleMatches &&
+                        typeMatches &&
+                        difficultyMatches
+                    );
+                })
+                .slice(0, 8)
+                .map((exercise) => {
+                    const imageUrls =
+                        exercise.images.map(
+                            (imagePath) =>
+                                "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises/" +
+                                imagePath
+                        );
+
+                    return {
+                        id: exercise.id,
+                        name: exercise.name,
+                        level: exercise.level,
+                        equipment:
+                            exercise.equipment,
+                        category:
+                            exercise.category,
+                        primaryMuscles:
+                            exercise.primaryMuscles,
+                        instructions:
+                            exercise.instructions,
+                        images: imageUrls,
+                    };
+                });
+
+            res.json(results);
+        } catch (error) {
+            console.error(
+                "GET /exercise-images failed:",
+                error.message
+            );
+
+            res.status(502).json({
+                error:
+                    "Unable to load exercise images",
+            });
+        }
+    }
+);
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
