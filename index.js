@@ -3,7 +3,6 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-// 使用刚刚建立的数据库连接和 Supabase 客户端
 const { pool } = require("./db");
 const {
     supabase,
@@ -15,32 +14,27 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 检查服务器是否运行
 app.get("/", (req, res) => {
     res.json({
         message: "Gym Tracker API is running",
     });
 });
 
-// 注册账号
 app.post("/auth/signup", async (req, res) => {
     const { username, email, password } = req.body || {};
 
-    // 检查用户名
     if (typeof username !== "string" || !username.trim()) {
         return res.status(400).json({
             error: "Username is required",
         });
     }
 
-    // 检查邮箱
     if (typeof email !== "string" || !email.trim()) {
         return res.status(400).json({
             error: "Email is required",
         });
     }
 
-    // 密码不使用 trim，避免改变用户输入的密码
     if (typeof password !== "string" || password.length < 6) {
         return res.status(400).json({
             error: "Password must contain at least 6 characters",
@@ -48,8 +42,6 @@ app.post("/auth/signup", async (req, res) => {
     }
 
     try {
-        // 第一步：让 Supabase Auth 创建账号
-        // 密码由 Supabase 处理，不写进 public.users
         const { data, error } = await supabase.auth.signUp({
             email: email.trim(),
             password,
@@ -72,8 +64,6 @@ app.post("/auth/signup", async (req, res) => {
             });
         }
 
-        // 第二步：将 Auth 的 UUID 和用户名保存到 users 表
-        // $1、$2 是参数占位符，不直接拼接用户输入
         const result = await pool.query(
             `INSERT INTO users (id, username)
        VALUES ($1, $2)
@@ -81,7 +71,6 @@ app.post("/auth/signup", async (req, res) => {
             [data.user.id, username.trim()]
         );
 
-        // 是否马上获得 session，取决于邮箱确认设置
         res.status(201).json({
             message: data.session
                 ? "Account created successfully"
@@ -92,26 +81,21 @@ app.post("/auth/signup", async (req, res) => {
     } catch (error) {
         console.error("POST /auth/signup failed:", error.message);
 
-        // Auth 创建账号和保存资料是两个步骤
-        // 保存资料失败，不代表前面的 Auth 账号没有建立
         res.status(500).json({
             error:
                 "Unable to complete registration. An Auth account may already have been created.",
         });
     }
 });
-// 邮箱和密码登录
 app.post("/auth/login", async (req, res) => {
     const { email, password } = req.body || {};
 
-    // 检查有没有填写邮箱
     if (typeof email !== "string" || !email.trim()) {
         return res.status(400).json({
             error: "Email is required",
         });
     }
 
-    // 检查有没有填写密码，不改变密码本身
     if (typeof password !== "string" || !password) {
         return res.status(400).json({
             error: "Password is required",
@@ -119,27 +103,23 @@ app.post("/auth/login", async (req, res) => {
     }
 
     try {
-        // 让 Supabase 验证邮箱和密码
         const { data, error } = await supabase.auth.signInWithPassword({
             email: email.trim(),
             password,
         });
 
-        // 登录失败
         if (error) {
             return res.status(401).json({
                 error: error.message,
             });
         }
 
-        // 确认成功取得登录 session
         if (!data.session) {
             return res.status(401).json({
                 error: "Unable to create a login session",
             });
         }
 
-        // 返回 session，里面包含 access_token
         res.json({
             session: data.session,
         });
@@ -151,7 +131,6 @@ app.post("/auth/login", async (req, res) => {
         });
     }
 });
-// 验证 access token
 async function verifySupabaseSession(req, res, next) {
     const auth = req.headers.authorization;
 
@@ -194,8 +173,44 @@ async function verifySupabaseSession(req, res, next) {
         });
     }
 }
+app.post(
+    "/auth/google-profile",
+    verifySupabaseSession,
+    async (req, res) => {
+        try {
+            const emailName =
+                req.user.email?.split("@")[0] || "user";
 
-// 获取当前登录用户
+            const cleanName = emailName
+                .toLowerCase()
+                .replace(/[^a-z0-9_]/g, "")
+                .slice(0, 20);
+
+            const username =
+                `${cleanName || "user"}_${req.user.userId.slice(0, 6)}`;
+
+            const result = await pool.query(
+                `INSERT INTO users (id, username)
+                 VALUES ($1, $2)
+                 ON CONFLICT (id)
+                 DO UPDATE SET username = users.username
+                 RETURNING id, username, created_at`,
+                [req.user.userId, username]
+            );
+
+            res.json(result.rows[0]);
+        } catch (error) {
+            console.error(
+                "POST /auth/google-profile failed:",
+                error.message
+            );
+
+            res.status(500).json({
+                error: "Unable to create Google user profile",
+            });
+        }
+    }
+);
 app.get("/whoami", verifySupabaseSession, async (req, res) => {
     try {
         const result = await pool.query(
@@ -224,46 +239,55 @@ app.get("/whoami", verifySupabaseSession, async (req, res) => {
     }
 });
 
-// 新增自己的训练记录
+const workoutBodyParts = [
+    "chest",
+    "shoulder",
+    "arm",
+    "leg",
+    "core",
+    "back",
+];
+
 app.post("/workouts", verifySupabaseSession, async (req, res) => {
     const {
         workout_date,
+        body_part,
         exercise_name,
         sets,
         reps,
         weight,
     } = req.body || {};
 
-    // 日期不能为空，前端使用 YYYY-MM-DD 格式
     if (typeof workout_date !== "string" || !workout_date.trim()) {
         return res.status(400).json({
             error: "Workout date is required",
         });
     }
 
-    // 动作名称不能为空
+    if (!workoutBodyParts.includes(body_part)) {
+        return res.status(400).json({
+            error: "Choose a valid body part",
+        });
+    }
+
     if (typeof exercise_name !== "string" || !exercise_name.trim()) {
         return res.status(400).json({
             error: "Exercise name is required",
         });
     }
 
-    // 组数必须是大于 0 的整数
     if (!Number.isInteger(sets) || sets <= 0) {
         return res.status(400).json({
             error: "Sets must be a positive integer",
         });
     }
 
-    // 每组次数必须是大于 0 的整数
     if (!Number.isInteger(reps) || reps <= 0) {
         return res.status(400).json({
             error: "Reps must be a positive integer",
         });
     }
 
-    // 重量必须是数字，0 代表不额外负重
-    // 上限对应数据库 NUMERIC(7, 2) 字段
     if (
         typeof weight !== "number" ||
         weight < 0 ||
@@ -277,13 +301,13 @@ app.post("/workouts", verifySupabaseSession, async (req, res) => {
     try {
         const result = await pool.query(
             `INSERT INTO workouts
-         (user_id, workout_date, exercise_name, sets, reps, weight)
-       VALUES ($1, $2, $3, $4, $5, $6)
+         (user_id, workout_date, body_part, exercise_name, sets, reps, weight)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
             [
-                // 使用 token 验证后的身份，不接受前端指定 user_id
                 req.user.userId,
                 workout_date.trim(),
+                body_part,
                 exercise_name.trim(),
                 sets,
                 reps,
@@ -293,7 +317,6 @@ app.post("/workouts", verifySupabaseSession, async (req, res) => {
 
         res.status(201).json(result.rows[0]);
     } catch (error) {
-        // 数据库拒绝不存在的日期或超出范围的数字
         if (
             error.code === "22007" ||
             error.code === "22008" ||
@@ -304,7 +327,6 @@ app.post("/workouts", verifySupabaseSession, async (req, res) => {
             });
         }
 
-        // Auth 账号存在，但 users 表没有对应的资料
         if (error.code === "23503") {
             return res.status(409).json({
                 error: "User profile is missing",
@@ -319,7 +341,6 @@ app.post("/workouts", verifySupabaseSession, async (req, res) => {
     }
 });
 
-// 查看自己的训练记录
 app.get("/workouts", verifySupabaseSession, async (req, res) => {
     try {
         const result = await pool.query(
@@ -330,7 +351,6 @@ app.get("/workouts", verifySupabaseSession, async (req, res) => {
             [req.user.userId]
         );
 
-        // 没有记录时返回 []，不属于错误
         res.json(result.rows);
     } catch (error) {
         console.error("GET /workouts failed:", error.message);
@@ -340,11 +360,9 @@ app.get("/workouts", verifySupabaseSession, async (req, res) => {
         });
     }
 });
-// 修改自己的训练记录
 app.patch("/workouts/:id", verifySupabaseSession, async (req, res) => {
     const id = Number(req.params.id);
 
-    // 数据库的记录 ID 必须是有效的正整数
     if (!Number.isInteger(id) || id <= 0 || id > 2147483647) {
         return res.status(400).json({
             error: "Invalid workout ID",
@@ -353,15 +371,16 @@ app.patch("/workouts/:id", verifySupabaseSession, async (req, res) => {
 
     const {
         workout_date,
+        body_part,
         exercise_name,
         sets,
         reps,
         weight,
     } = req.body || {};
 
-    // 至少提供一个需要修改的字段
     if (
         workout_date === undefined &&
+        body_part === undefined &&
         exercise_name === undefined &&
         sets === undefined &&
         reps === undefined &&
@@ -372,13 +391,21 @@ app.patch("/workouts/:id", verifySupabaseSession, async (req, res) => {
         });
     }
 
-    // PATCH 只检查用户有提供的字段
     if (
         workout_date !== undefined &&
         (typeof workout_date !== "string" || !workout_date.trim())
     ) {
         return res.status(400).json({
             error: "Workout date cannot be empty",
+        });
+    }
+
+    if (
+        body_part !== undefined &&
+        !workoutBodyParts.includes(body_part)
+    ) {
+        return res.status(400).json({
+            error: "Choose a valid body part",
         });
     }
 
@@ -419,19 +446,19 @@ app.patch("/workouts/:id", verifySupabaseSession, async (req, res) => {
     }
 
     try {
-        // COALESCE：没有提供新值的字段，保留原本的值
-        // 必须同时匹配记录 ID 和当前用户 ID
         const result = await pool.query(
             `UPDATE workouts
        SET workout_date = COALESCE($1, workout_date),
-           exercise_name = COALESCE($2, exercise_name),
-           sets = COALESCE($3, sets),
-           reps = COALESCE($4, reps),
-           weight = COALESCE($5, weight)
-       WHERE id = $6 AND user_id = $7
+           body_part = COALESCE($2, body_part),
+           exercise_name = COALESCE($3, exercise_name),
+           sets = COALESCE($4, sets),
+           reps = COALESCE($5, reps),
+           weight = COALESCE($6, weight)
+       WHERE id = $7 AND user_id = $8
        RETURNING *`,
             [
                 workout_date === undefined ? null : workout_date.trim(),
+                body_part === undefined ? null : body_part,
                 exercise_name === undefined ? null : exercise_name.trim(),
                 sets,
                 reps,
@@ -441,7 +468,6 @@ app.patch("/workouts/:id", verifySupabaseSession, async (req, res) => {
             ]
         );
 
-        // 不存在或不属于自己的记录，都不允许修改
         if (result.rows.length === 0) {
             return res.status(404).json({
                 error: "Workout not found",
@@ -468,7 +494,6 @@ app.patch("/workouts/:id", verifySupabaseSession, async (req, res) => {
     }
 });
 
-// 删除自己的训练记录
 app.delete("/workouts/:id", verifySupabaseSession, async (req, res) => {
     const id = Number(req.params.id);
 
@@ -479,7 +504,6 @@ app.delete("/workouts/:id", verifySupabaseSession, async (req, res) => {
     }
 
     try {
-        // 即使知道别人的记录 ID，也不能删除
         const result = await pool.query(
             `DELETE FROM workouts
        WHERE id = $1 AND user_id = $2
@@ -505,7 +529,6 @@ app.delete("/workouts/:id", verifySupabaseSession, async (req, res) => {
         });
     }
 });
-// 为 private Storage 图片建立临时 signed URL
 async function addSignedImageUrls(posts) {
     const postsWithImageUrls = [];
 
@@ -543,75 +566,71 @@ async function addSignedImageUrls(posts) {
 
     return postsWithImageUrls;
 }
-// 清理上传成功但没有被帖子使用的图片
 app.delete(
-  "/post-images/cleanup",
-  verifySupabaseSession,
-  async (req, res) => {
-    const { image_path } = req.body || {};
+    "/post-images/cleanup",
+    verifySupabaseSession,
+    async (req, res) => {
+        const { image_path } = req.body || {};
 
-    if (typeof image_path !== "string" || !image_path.trim()) {
-      return res.status(400).json({
-        error: "Image path is required",
-      });
-    }
+        if (typeof image_path !== "string" || !image_path.trim()) {
+            return res.status(400).json({
+                error: "Image path is required",
+            });
+        }
 
-    const cleanImagePath = image_path.trim();
-    const userFolder = `${req.user.userId}/`;
+        const cleanImagePath = image_path.trim();
+        const userFolder = `${req.user.userId}/`;
 
-    // 用户只能清理自己 UUID 文件夹中的图片
-    if (!cleanImagePath.startsWith(userFolder)) {
-      return res.status(403).json({
-        error: "You cannot delete this image",
-      });
-    }
+        if (!cleanImagePath.startsWith(userFolder)) {
+            return res.status(403).json({
+                error: "You cannot delete this image",
+            });
+        }
 
-    try {
-      // 已经属于帖子的图片不能通过此接口删除
-      const linkedPost = await pool.query(
-        `SELECT id
+        try {
+            const linkedPost = await pool.query(
+                `SELECT id
          FROM posts
          WHERE author_id = $1
            AND image_path = $2
          LIMIT 1`,
-        [req.user.userId, cleanImagePath]
-      );
+                [req.user.userId, cleanImagePath]
+            );
 
-      if (linkedPost.rows.length > 0) {
-        return res.status(409).json({
-          error: "This image belongs to a post",
-        });
-      }
+            if (linkedPost.rows.length > 0) {
+                return res.status(409).json({
+                    error: "This image belongs to a post",
+                });
+            }
 
-      const { error: storageError } = await supabaseAdmin.storage
-        .from("post-images")
-        .remove([cleanImagePath]);
+            const { error: storageError } = await supabaseAdmin.storage
+                .from("post-images")
+                .remove([cleanImagePath]);
 
-      if (storageError) {
-        console.error("Image cleanup failed:", storageError.message);
+            if (storageError) {
+                console.error("Image cleanup failed:", storageError.message);
 
-        return res.status(502).json({
-          error: "Unable to clean up image",
-        });
-      }
+                return res.status(502).json({
+                    error: "Unable to clean up image",
+                });
+            }
 
-      res.json({
-        message: "Unused image deleted successfully",
-      });
-    } catch (error) {
-      console.error(
-        "DELETE /post-images/cleanup failed:",
-        error.message
-      );
+            res.json({
+                message: "Unused image deleted successfully",
+            });
+        } catch (error) {
+            console.error(
+                "DELETE /post-images/cleanup failed:",
+                error.message
+            );
 
-      res.status(500).json({
-        error: "Unable to clean up image",
-      });
+            res.status(500).json({
+                error: "Unable to clean up image",
+            });
+        }
     }
-  }
 );
 
-// 发布健身动态
 app.post("/posts", verifySupabaseSession, async (req, res) => {
     const {
         content,
@@ -620,21 +639,18 @@ app.post("/posts", verifySupabaseSession, async (req, res) => {
         image_path,
     } = req.body || {};
 
-    // 帖子必须有文字内容
     if (typeof content !== "string" || !content.trim()) {
         return res.status(400).json({
             error: "Post content is required",
         });
     }
 
-    // 只接受这两种可见范围
     if (visibility !== "public" && visibility !== "friends-only") {
         return res.status(400).json({
             error: "Visibility must be public or friends-only",
         });
     }
 
-    // 图片可以不传；有传时必须是字符串
     if (
         image_url !== undefined &&
         image_url !== null &&
@@ -662,7 +678,6 @@ app.post("/posts", verifySupabaseSession, async (req, res) => {
        VALUES ($1, $2, $3, $4, $5)
        RETURNING *`,
             [
-                // 作者身份必须来自已验证的 token
                 req.user.userId,
                 content.trim(),
                 visibility,
@@ -688,7 +703,6 @@ app.post("/posts", verifySupabaseSession, async (req, res) => {
 });
 
 
-// 登录后读取自己有权限查看的动态
 app.get("/posts", verifySupabaseSession, async (req, res) => {
     try {
         const result = await pool.query(
@@ -717,13 +731,10 @@ app.get("/posts", verifySupabaseSession, async (req, res) => {
             [req.user.userId]
         );
 
-        // 没有动态时返回空数组
-        // 只为已经通过帖子权限检查的动态建立图片链接
         const posts = await addSignedImageUrls(
             result.rows
         );
 
-        // 没有动态时返回空数组
         res.json(posts);
     } catch (error) {
         console.error("GET /posts failed:", error.message);
@@ -733,7 +744,6 @@ app.get("/posts", verifySupabaseSession, async (req, res) => {
         });
     }
 });
-// 修改自己的帖子
 app.patch("/posts/:id", verifySupabaseSession, async (req, res) => {
     const id = Number(req.params.id);
 
@@ -745,7 +755,6 @@ app.patch("/posts/:id", verifySupabaseSession, async (req, res) => {
 
     const { content, visibility } = req.body || {};
 
-    // 至少提供一个需要修改的字段
     if (content === undefined && visibility === undefined) {
         return res.status(400).json({
             error: "Provide content or visibility to update",
@@ -772,8 +781,6 @@ app.patch("/posts/:id", verifySupabaseSession, async (req, res) => {
     }
 
     try {
-        // 没有提供的字段保持原值
-        // 只能修改属于当前用户的帖子
         const result = await pool.query(
             `UPDATE posts
        SET content = COALESCE($1, content),
@@ -804,7 +811,6 @@ app.patch("/posts/:id", verifySupabaseSession, async (req, res) => {
     }
 });
 
-// 删除自己的帖子
 app.delete("/posts/:id", verifySupabaseSession, async (req, res) => {
     const id = Number(req.params.id);
 
@@ -822,7 +828,6 @@ app.delete("/posts/:id", verifySupabaseSession, async (req, res) => {
             [id, req.user.userId]
         );
 
-        // 不存在或不属于当前用户，都不能删除
         if (result.rows.length === 0) {
             return res.status(404).json({
                 error: "Post not found",
@@ -832,7 +837,6 @@ app.delete("/posts/:id", verifySupabaseSession, async (req, res) => {
         const imagePath =
             result.rows[0].image_path;
 
-        // 帖子删除成功后，清理对应的 Storage 图片
         if (imagePath) {
             const {
                 error: storageError,
@@ -868,14 +872,12 @@ function isUuid(value) {
     return typeof value === "string" && UUID_RE.test(value);
 }
 
-// 显示或搜索其他用户
 app.get("/users", verifySupabaseSession, async (req, res) => {
     const search = req.query.search;
 
     try {
         let usersResult;
 
-        // 有 search query 时，根据用户名搜索
         if (search) {
             usersResult = await pool.query(
                 `SELECT id, username, created_at
@@ -889,7 +891,6 @@ app.get("/users", verifySupabaseSession, async (req, res) => {
                 ]
             );
         } else {
-            // 没有 search query 时，显示所有其他用户
             usersResult = await pool.query(
                 `SELECT id, username, created_at
                  FROM users
@@ -899,7 +900,6 @@ app.get("/users", verifySupabaseSession, async (req, res) => {
             );
         }
 
-        // 找出当前用户已有的好友关系或申请
         const friendshipsResult = await pool.query(
             `SELECT
                 id,
@@ -912,7 +912,6 @@ app.get("/users", verifySupabaseSession, async (req, res) => {
             [req.user.userId]
         );
 
-        // 给每一位用户加入当前的好友状态
         for (const user of usersResult.rows) {
             user.friendship_status = "none";
 
@@ -949,7 +948,6 @@ app.get("/users", verifySupabaseSession, async (req, res) => {
     }
 });
 
-// 发送好友申请
 app.post(
     "/friend-requests",
     verifySupabaseSession,
@@ -970,7 +968,6 @@ app.post(
         }
 
         try {
-            // 确认要添加的用户存在
             const userResult = await pool.query(
                 `SELECT id, username
                  FROM users
@@ -984,7 +981,6 @@ app.post(
                 });
             }
 
-            // 检查两个方向有没有现有申请或好友关系
             const existingResult = await pool.query(
                 `SELECT
                     id,
@@ -1067,7 +1063,6 @@ app.post(
     }
 );
 
-// 查看自己收到的好友申请
 app.get(
     "/friend-requests",
     verifySupabaseSession,
@@ -1112,7 +1107,6 @@ app.get(
     }
 );
 
-// 接受好友申请
 app.patch(
     "/friend-requests/:id/accept",
     verifySupabaseSession,
@@ -1162,10 +1156,8 @@ app.patch(
     }
 );
 
-// 查看好友列表
 app.get("/friends", verifySupabaseSession, async (req, res) => {
     try {
-        // 当前用户是申请发送者
         const sentResult = await pool.query(
             `SELECT
                 users.id,
@@ -1186,7 +1178,6 @@ app.get("/friends", verifySupabaseSession, async (req, res) => {
             ]
         );
 
-        // 当前用户是申请接收者
         const receivedResult = await pool.query(
             `SELECT
                 users.id,
@@ -1221,21 +1212,18 @@ app.get("/friends", verifySupabaseSession, async (req, res) => {
         });
     }
 });
-// 从 API Ninjas 搜索健身动作
 app.get(
     "/exercise-suggestions",
     verifySupabaseSession,
     async (req, res) => {
         const { name, muscle, type, difficulty } = req.query;
 
-        // 至少需要一个搜索条件
         if (!name && !muscle && !type && !difficulty) {
             return res.status(400).json({
                 error: "Provide name, muscle, type, or difficulty",
             });
         }
 
-        // 检查查询参数
         if (name !== undefined && typeof name !== "string") {
             return res.status(400).json({
                 error: "Exercise name must be a string",
@@ -1263,14 +1251,12 @@ app.get(
             });
         }
 
-        // 检查服务器有没有 API key
         if (!process.env.API_NINJAS_KEY) {
             return res.status(500).json({
                 error: "Exercise API key is missing",
             });
         }
 
-        // 建立 API 查询参数
         const filters = [];
 
         if (name && name.trim()) {
@@ -1327,11 +1313,8 @@ app.get(
         }
     }
 );
-// 暂时保存 free-exercise-db 的动作资料
-// 服务器重新启动后会重新下载一次
 let freeExerciseCache = null;
 
-// 从 free-exercise-db 搜索带图片的健身动作
 app.get(
     "/exercise-images",
     verifySupabaseSession,
@@ -1343,7 +1326,6 @@ app.get(
             difficulty,
         } = req.query;
 
-        // 至少需要一个搜索条件
         if (!name && !muscle && !type && !difficulty) {
             return res.status(400).json({
                 error:
@@ -1352,7 +1334,6 @@ app.get(
         }
 
         try {
-            // 第一次搜索时才下载资料
             if (!freeExerciseCache) {
                 const response = await fetch(
                     "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/dist/exercises.json"
@@ -1373,22 +1354,20 @@ app.get(
                 ? name.trim().toLowerCase()
                 : "";
 
-            // 前端使用 lower_back，
-            // 数据集使用 lower back
             const searchMuscle = muscle
                 ? muscle
-                      .trim()
-                      .toLowerCase()
-                      .split("_")
-                      .join(" ")
+                    .trim()
+                    .toLowerCase()
+                    .split("_")
+                    .join(" ")
                 : "";
 
             const searchType = type
                 ? type
-                      .trim()
-                      .toLowerCase()
-                      .split("_")
-                      .join(" ")
+                    .trim()
+                    .toLowerCase()
+                    .split("_")
+                    .join(" ")
                 : "";
 
             const searchDifficulty = difficulty
@@ -1428,12 +1407,12 @@ app.get(
                     const typeMatches =
                         !searchType ||
                         exercise.category ===
-                            searchType;
+                        searchType;
 
                     const difficultyMatches =
                         !searchDifficulty ||
                         exercise.level ===
-                            searchDifficulty;
+                        searchDifficulty;
 
                     return (
                         nameMatches &&
@@ -1477,6 +1456,219 @@ app.get(
             res.status(502).json({
                 error:
                     "Unable to load exercise images",
+            });
+        }
+    }
+);
+function findFoodNutrient(food, nutrientNames) {
+    const nutrients = food.foodNutrients || [];
+
+    const nutrient = nutrients.find((item) =>
+        nutrientNames.includes(item.nutrientName)
+    );
+
+    if (!nutrient) {
+        return {
+            value: 0,
+            unit: "",
+        };
+    }
+
+    return {
+        value: nutrient.value || 0,
+        unit: nutrient.unitName || "",
+    };
+}
+
+function createIngredientImageUrl(foodName) {
+    const imageName = foodName
+        .trim()
+        .toLowerCase()
+        .split(" ")
+        .join("_");
+
+    return (
+        "https://www.themealdb.com/images/ingredients/" +
+        encodeURIComponent(imageName) +
+        ".png"
+    );
+}
+
+app.get(
+    "/food-calories",
+    verifySupabaseSession,
+    async (req, res) => {
+        const query = req.query.query;
+
+        if (typeof query !== "string" || !query.trim()) {
+            return res.status(400).json({
+                error: "Food search is required",
+            });
+        }
+
+        if (!process.env.USDA_API_KEY) {
+            return res.status(500).json({
+                error: "USDA API key is missing",
+            });
+        }
+
+        const cleanQuery = query.trim();
+
+        const apiUrl =
+            "https://api.nal.usda.gov/fdc/v1/foods/search" +
+            "?api_key=" +
+            encodeURIComponent(process.env.USDA_API_KEY) +
+            "&query=" +
+            encodeURIComponent(cleanQuery) +
+            "&pageSize=12";
+
+        try {
+            const response = await fetch(apiUrl);
+
+            if (!response.ok) {
+                return res.status(502).json({
+                    error: "Food nutrition service is unavailable",
+                });
+            }
+
+            const data = await response.json();
+
+            const foods = (data.foods || []).map((food) => {
+                const calories = findFoodNutrient(food, [
+                    "Energy",
+                ]);
+
+                const protein = findFoodNutrient(food, [
+                    "Protein",
+                ]);
+
+                const carbohydrates = findFoodNutrient(food, [
+                    "Carbohydrate, by difference",
+                ]);
+
+                const fat = findFoodNutrient(food, [
+                    "Total lipid (fat)",
+                ]);
+
+                return {
+                    id: food.fdcId,
+                    name: food.description,
+                    brand: food.brandOwner || null,
+                    serving_size: food.servingSize || 100,
+                    serving_unit: food.servingSizeUnit || "g",
+
+                    calories: calories.value,
+                    calories_unit: calories.unit,
+
+                    protein: protein.value,
+                    protein_unit: protein.unit,
+
+                    carbohydrates: carbohydrates.value,
+                    carbohydrates_unit:
+                        carbohydrates.unit,
+
+                    fat: fat.value,
+                    fat_unit: fat.unit,
+
+                    image_url:
+                        createIngredientImageUrl(
+                            cleanQuery
+                        ),
+                };
+            });
+
+            res.json(foods);
+        } catch (error) {
+            console.error(
+                "GET /food-calories failed:",
+                error.message
+            );
+
+            res.status(502).json({
+                error: "Unable to load food nutrition",
+            });
+        }
+    }
+);
+
+function createIngredientList(meal) {
+    const ingredients = [];
+
+    for (let number = 1; number <= 20; number++) {
+        const ingredient =
+            meal[`strIngredient${number}`];
+
+        const measure =
+            meal[`strMeasure${number}`];
+
+        if (ingredient && ingredient.trim()) {
+            ingredients.push({
+                name: ingredient.trim(),
+                measure: measure
+                    ? measure.trim()
+                    : "",
+            });
+        }
+    }
+
+    return ingredients;
+}
+
+app.get(
+    "/meal-ideas",
+    verifySupabaseSession,
+    async (req, res) => {
+        const search = req.query.search;
+
+        if (
+            typeof search !== "string" ||
+            !search.trim()
+        ) {
+            return res.status(400).json({
+                error: "Meal search is required",
+            });
+        }
+
+        const apiUrl =
+            "https://www.themealdb.com/api/json/v1/1/search.php?s=" +
+            encodeURIComponent(search.trim());
+
+        try {
+            const response = await fetch(apiUrl);
+
+            if (!response.ok) {
+                return res.status(502).json({
+                    error: "Meal service is unavailable",
+                });
+            }
+
+            const data = await response.json();
+
+            const meals = (data.meals || []).map(
+                (meal) => ({
+                    id: meal.idMeal,
+                    name: meal.strMeal,
+                    category: meal.strCategory,
+                    country: meal.strArea,
+                    image_url: meal.strMealThumb,
+                    instructions:
+                        meal.strInstructions,
+                    video_url:
+                        meal.strYoutube || null,
+                    ingredients:
+                        createIngredientList(meal),
+                })
+            );
+
+            res.json(meals);
+        } catch (error) {
+            console.error(
+                "GET /meal-ideas failed:",
+                error.message
+            );
+
+            res.status(502).json({
+                error: "Unable to load meal ideas",
             });
         }
     }
