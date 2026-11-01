@@ -239,6 +239,11 @@ app.get("/whoami", verifySupabaseSession, async (req, res) => {
     }
 });
 
+function parsePositiveInteger(value, max = 2147483647) {
+    const id = Number(value);
+    return Number.isInteger(id) && id > 0 && id <= max ? id : null;
+}
+
 const workoutBodyParts = [
     "chest",
     "shoulder",
@@ -361,9 +366,9 @@ app.get("/workouts", verifySupabaseSession, async (req, res) => {
     }
 });
 app.patch("/workouts/:id", verifySupabaseSession, async (req, res) => {
-    const id = Number(req.params.id);
+    const id = parsePositiveInteger(req.params.id);
 
-    if (!Number.isInteger(id) || id <= 0 || id > 2147483647) {
+    if (!id) {
         return res.status(400).json({
             error: "Invalid workout ID",
         });
@@ -495,9 +500,9 @@ app.patch("/workouts/:id", verifySupabaseSession, async (req, res) => {
 });
 
 app.delete("/workouts/:id", verifySupabaseSession, async (req, res) => {
-    const id = Number(req.params.id);
+    const id = parsePositiveInteger(req.params.id);
 
-    if (!Number.isInteger(id) || id <= 0 || id > 2147483647) {
+    if (!id) {
         return res.status(400).json({
             error: "Invalid workout ID",
         });
@@ -992,9 +997,9 @@ app.patch(
     "/friend-requests/:id/accept",
     verifySupabaseSession,
     async (req, res) => {
-        const id = Number(req.params.id);
+        const id = parsePositiveInteger(req.params.id);
 
-        if (!Number.isInteger(id) || id <= 0) {
+        if (!id) {
             return res.status(400).json({
                 error: "Invalid friend request ID",
             });

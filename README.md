@@ -6,7 +6,7 @@ This repository contains the Express API. The React frontend is maintained in a 
 
 ## Live Application
 
-- Frontend: [https://gym-tracker-frontend-vert.vercel.app](https://gym-tracker-frontend-vert.vercel.app)
+- Frontend: [https://weset.vercel.app](https://weset.vercel.app)
 - Backend API: [https://gym-backed-production.up.railway.app](https://gym-backed-production.up.railway.app)
 - Frontend repository: [https://github.com/tehhongjun6-alt/gym-tracker-frontend](https://github.com/tehhongjun6-alt/gym-tracker-frontend)
 
